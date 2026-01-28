@@ -1,5 +1,6 @@
 
 import React, { useState, useEffect, useCallback } from 'react';
+import { createClient } from '@supabase/supabase-js';
 import { RaffleNumber, RaffleState } from './types';
 import { TOTAL_NUMBERS, PRICE_PER_NUMBER, PIX_KEY, APP_MESSAGES } from './constants';
 import RaffleGrid from './components/RaffleGrid';
@@ -9,6 +10,12 @@ import AdminReport from './components/AdminReport';
 import PasswordModal from './components/PasswordModal';
 import Header from './components/Header';
 import Stats from './components/Stats';
+
+// Inicializa o Supabase (usa env vars da Vercel)
+// Use process.env to avoid TypeScript errors on ImportMeta and align with project environment standards
+const supabaseUrl = process.env.VITE_SUPABASE_URL || '';
+const supabaseAnonKey = process.env.VITE_SUPABASE_ANON_KEY || '';
+const supabase = (supabaseUrl && supabaseAnonKey) ? createClient(supabaseUrl, supabaseAnonKey) : null;
 
 const App: React.FC = () => {
   const [raffle, setRaffle] = useState<RaffleState>({
@@ -22,28 +29,59 @@ const App: React.FC = () => {
   const [showAdmin, setShowAdmin] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
+  const [isSyncing, setIsSyncing] = useState(false);
 
-  // Initialize numbers from localStorage or defaults
-  useEffect(() => {
-    const saved = localStorage.getItem('rifa_smartwash_numbers');
-    if (saved) {
-      setRaffle(prev => ({ ...prev, numbers: JSON.parse(saved) }));
-    } else {
-      const initial: RaffleNumber[] = Array.from({ length: TOTAL_NUMBERS }, (_, i) => ({
-        id: i + 1,
-        status: 'available'
+  // Carrega dados do Banco de Dados
+  const fetchNumbers = useCallback(async () => {
+    if (!supabase) {
+      // Fallback para localStorage se não houver Supabase configurado
+      const saved = localStorage.getItem('rifa_smartwash_numbers');
+      if (saved) {
+        setRaffle(prev => ({ ...prev, numbers: JSON.parse(saved) }));
+      } else {
+        const initial: RaffleNumber[] = Array.from({ length: TOTAL_NUMBERS }, (_, i) => ({
+          id: i + 1,
+          status: 'available'
+        }));
+        setRaffle(prev => ({ ...prev, numbers: initial }));
+      }
+      setIsLoading(false);
+      return;
+    }
+
+    const { data, error } = await supabase
+      .from('raffle_numbers')
+      .select('*')
+      .order('id', { ascending: true });
+
+    if (error) {
+      console.error('Erro ao buscar números:', error);
+    } else if (data) {
+      const formatted: RaffleNumber[] = data.map(item => ({
+        id: item.id,
+        status: item.status as any,
+        ownerName: item.owner_name,
+        ownerPhone: item.owner_phone
       }));
-      setRaffle(prev => ({ ...prev, numbers: initial }));
+      setRaffle(prev => ({ ...prev, numbers: formatted }));
     }
     setIsLoading(false);
   }, []);
 
-  // Save to localStorage whenever numbers update (simulating DB for this demo)
   useEffect(() => {
-    if (raffle.numbers.length > 0) {
-      localStorage.setItem('rifa_smartwash_numbers', JSON.stringify(raffle.numbers));
+    fetchNumbers();
+    
+    // Opcional: Realtime updates (escuta mudanças no banco)
+    if (supabase) {
+      const channel = supabase
+        .channel('schema-db-changes')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'raffle_numbers' }, () => {
+          fetchNumbers();
+        })
+        .subscribe();
+      return () => { supabase.removeChannel(channel); };
     }
-  }, [raffle.numbers]);
+  }, [fetchNumbers]);
 
   const handleToggleNumber = useCallback((id: number) => {
     setRaffle(prev => {
@@ -62,11 +100,7 @@ const App: React.FC = () => {
         return n;
       });
 
-      return {
-        ...prev,
-        numbers: newNumbers,
-        selectedIds: newSelectedIds
-      };
+      return { ...prev, numbers: newNumbers, selectedIds: newSelectedIds };
     });
   }, []);
 
@@ -75,42 +109,58 @@ const App: React.FC = () => {
     setShowModal(true);
   };
 
-  const handlePaymentConfirmed = (name: string, phone: string) => {
-    // Simulate confirming payment - mark selected as sold with buyer info
-    setRaffle(prev => ({
-      ...prev,
-      numbers: prev.numbers.map(n => 
-        prev.selectedIds.includes(n.id) ? { 
-          ...n, 
-          status: 'sold' as const,
-          ownerName: name,
-          ownerPhone: phone
-        } : n
-      ),
-      selectedIds: []
-    }));
+  const handlePaymentConfirmed = async (name: string, phone: string) => {
+    setIsSyncing(true);
+    
+    if (supabase) {
+      // Salva no Banco de Dados Real
+      const updates = raffle.selectedIds.map(id => ({
+        id,
+        status: 'sold',
+        owner_name: name,
+        owner_phone: phone,
+        updated_at: new Date().toISOString()
+      }));
+
+      const { error } = await supabase
+        .from('raffle_numbers')
+        .upsert(updates);
+
+      if (error) {
+        alert("Erro ao salvar no banco: " + error.message);
+      } else {
+        await fetchNumbers();
+        setRaffle(prev => ({ ...prev, selectedIds: [] }));
+        alert(`Sucesso! Seus números foram reservados. Envie o comprovante agora.`);
+      }
+    } else {
+      // Fallback Local
+      setRaffle(prev => {
+        const newNumbers = prev.numbers.map(n => 
+          prev.selectedIds.includes(n.id) ? { ...n, status: 'sold' as const, ownerName: name, ownerPhone: phone } : n
+        );
+        localStorage.setItem('rifa_smartwash_numbers', JSON.stringify(newNumbers));
+        return { ...prev, numbers: newNumbers, selectedIds: [] };
+      });
+    }
+    
+    setIsSyncing(false);
     setShowModal(false);
-    alert(`Obrigado ${name}! Seu pagamento foi simulado e seus números foram reservados.`);
   };
 
-  const handleResetRaffle = () => {
-    localStorage.removeItem('rifa_smartwash_numbers');
-    const initial: RaffleNumber[] = Array.from({ length: TOTAL_NUMBERS }, (_, i) => ({
-      id: i + 1,
-      status: 'available'
-    }));
-    setRaffle(prev => ({
-      ...prev,
-      numbers: initial,
-      selectedIds: []
-    }));
+  const handleResetRaffle = async () => {
+    if (supabase) {
+      const { error } = await supabase
+        .from('raffle_numbers')
+        .update({ status: 'available', owner_name: null, owner_phone: null });
+      
+      if (!error) await fetchNumbers();
+    } else {
+      localStorage.removeItem('rifa_smartwash_numbers');
+      await fetchNumbers();
+    }
     setShowAdmin(false);
-    alert("Sistema reiniciado com sucesso!");
-  };
-
-  const handleAdminAccess = () => {
-    setShowPassword(false);
-    setShowAdmin(true);
+    alert("Rifa resetada!");
   };
 
   if (isLoading) {
@@ -129,9 +179,28 @@ const App: React.FC = () => {
       <Header />
       
       <main className="max-w-4xl mx-auto px-4 py-8 flex-grow">
+        <div className="flex justify-between items-center mb-4">
+           {!supabase && (
+             <span className="bg-amber-100 text-amber-700 px-3 py-1 rounded-full text-xs font-bold">
+               <i className="fas fa-exclamation-triangle mr-1"></i> Modo Offline (LocalStorage)
+             </span>
+           )}
+           {supabase && (
+             <span className="bg-emerald-100 text-emerald-700 px-3 py-1 rounded-full text-xs font-bold">
+               <i className="fas fa-sync mr-1"></i> Sincronizado com Nuvem
+             </span>
+           )}
+        </div>
+
         <Stats sold={soldCount} total={TOTAL_NUMBERS} available={availableCount} />
         
-        <div className="bg-white rounded-3xl shadow-xl p-6 md:p-10 mb-8 border border-slate-100">
+        <div className="bg-white rounded-3xl shadow-xl p-6 md:p-10 mb-8 border border-slate-100 relative">
+          {isSyncing && (
+            <div className="absolute inset-0 bg-white/50 backdrop-blur-sm z-10 flex items-center justify-center rounded-3xl">
+              <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-blue-600"></div>
+            </div>
+          )}
+          
           <div className="mb-6 flex flex-col md:flex-row md:items-center justify-between gap-4">
             <div>
               <h2 className="text-2xl font-bold text-slate-800">Escolha seus Números</h2>
@@ -166,8 +235,8 @@ const App: React.FC = () => {
           <div>
             <h4 className="font-bold text-lg">Como funciona?</h4>
             <p className="opacity-90 leading-relaxed">
-              Selecione um ou mais números acima. Clique em "Reservar Agora" para gerar sua chave Pix. 
-              Após o pagamento, envie o comprovante para o organizador. Quando todos os 100 números forem vendidos, o sorteio será realizado ao vivo!
+              Selecione seus números. Clique em "Reservar Agora" para gerar o Pix. 
+              Após pagar, envie o comprovante. Quando todos os números forem vendidos, o sorteio acontece!
             </p>
           </div>
         </div>
@@ -204,7 +273,7 @@ const App: React.FC = () => {
       {showPassword && (
         <PasswordModal 
           onClose={() => setShowPassword(false)}
-          onSuccess={handleAdminAccess}
+          onSuccess={() => { setShowPassword(false); setShowAdmin(true); }}
         />
       )}
 
